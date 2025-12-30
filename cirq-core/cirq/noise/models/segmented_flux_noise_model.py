@@ -28,10 +28,9 @@ def sample_flux_noise_segments(
 
 class SegmentedFluxNoiseModel(cirq.NoiseModel):
     """
-    根本性修复版：
     - 以“操作签名”而非 Operation 实例来索引时序与游标，避免回调次数与时序长度失配。
-    - 提供 overflow 策略（extend/cycle/error），默认 extend，不再漏喷。
-    - 仍保持对每一次回调都施加基于 (segment_id, qubit) 的 δϕ。
+    - 提供 overflow 策略（extend/cycle/error），默认 extend。
+    - 保持对每一次回调都施加基于 (segment_id, qubit) 的 δϕ。
     """
 
     def __init__(
