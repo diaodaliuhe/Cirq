@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List, Tuple, Sequence, Dict, Callable, Optional, Any
+import secrets
 from dataclasses import dataclass
 from scipy.optimize import curve_fit
 import numpy as np
@@ -7,7 +8,7 @@ import cirq
 
 from cirq.noise.utils.metrics import fidelity
 from cirq.noise.utils.noise_builder import make_noise_model
-from cirq.noise.utils.compilation_scheme import all_in_one_compile
+from cirq.noise.utils.compilation_scheme import all_in_one_compile, rb_1q_weak_compile_blockwise
 
 def _survival_prob_from_dm(dm: np.ndarray) -> float:
     """
@@ -691,3 +692,220 @@ def _run_rb_sweep_custom(
         "EPC": fit.EPC,
         "EPC_stderr": fit.EPC_stderr,
     }
+
+def _find_clifford_index_by_matrix(
+    target_u: np.ndarray,
+    clifford_mats: Sequence[np.ndarray],
+    *,
+    atol: float = 1e-8,
+) -> int:
+    """在 24 个 1Q Clifford 中找到与 target_u 等价（忽略全局相位）的那个。"""
+    for i, u in enumerate(clifford_mats):
+        if cirq.linalg.allclose_up_to_global_phase(target_u, u, atol=atol):
+            return int(i)
+    raise ValueError("Recovery Clifford not found in 1Q Clifford library.")
+
+def _resolve_rb_seed(seed: Optional[int]) -> int:
+    if seed is None:
+        return int(secrets.randbelow(2**32))
+    return int(seed)
+
+def _build_reverse_inverse_chain_indices(
+    seq_indices: Sequence[int],
+    clifford_mats: Sequence[np.ndarray],
+    *,
+    atol: float = 1e-8,
+) -> List[int]:
+    chain: List[int] = []
+    for idx in reversed(seq_indices):
+        u_inv = clifford_mats[int(idx)].conj().T
+        chain.append(_find_clifford_index_by_matrix(u_inv, clifford_mats, atol=atol))
+    return chain
+
+def _sample_idle_after_flags(m: int, rng: np.random.Generator, p_idle: float) -> List[bool]:
+    if m < 0:
+        raise ValueError(f"m must be non-negative, got {m}")
+    if not (0.0 <= p_idle <= 1.0):
+        raise ValueError(f"idle_insert_prob must be in [0, 1], got {p_idle}")
+    if m == 0 or p_idle == 0.0:
+        return [False] * m
+    return [bool(x) for x in (rng.random(m) < p_idle)]
+
+def _append_circuit_as_new_moments(dst: cirq.Circuit, src: cirq.Circuit) -> None:
+    for moment in src:
+        if moment.operations:
+            dst.append(moment, strategy=cirq.InsertStrategy.NEW)
+
+def build_1q_clifford_rb_circuit_compiled(
+    m: int,
+    qubit: cirq.Qid,
+    *,
+    seed: Optional[int] = None,
+    measure: bool = True,
+    key: str = "m",
+    atol: float = 1e-8,
+    compiler: Optional[Callable[[cirq.Circuit], cirq.Circuit]] = None,
+    idle_insert_prob: float = 0.0,
+    idle_duration_ns: float = 20.0,
+    insert_idle_after_recovery: bool = False,
+    recovery_mode: str = "single_clifford",
+) -> Tuple[cirq.Circuit, cirq.Circuit, Dict[str, Any]]:
+    """
+    生成单比特 Clifford RB 电路，并返回其 weak-compiled 版本。
+
+    参数
+    ----
+    m:
+        随机 Clifford 序列长度（不含 recovery）
+    qubit:
+        目标 qubit
+    seed:
+        随机种子
+    measure:
+        是否在末尾加入测量
+    key:
+        测量 key
+    atol:
+        恢复 Clifford 匹配时的容差
+    compiler:
+        可选的 compile 函数；若为 None，则默认使用 rb_1q_weak_compile_blockwise
+
+    返回
+    ----
+    abstract_circuit:
+        Clifford 层的抽象 RB 电路（含 recovery，不含 measurement）
+    compiled_circuit:
+        弱编译后的 native-gate 电路（若 measure=True，则末尾含 measurement）
+    meta:
+        一些辅助信息，包括随机 Clifford 下标和 recovery 下标
+    --------
+    1. abstract_circuit 只表示“逻辑 Clifford 序列 + recovery”，不包含 idle；
+    2. compiled_circuit 才表示真实执行线路：
+       - 每个 Clifford 单独 weak compile 成一个 block
+       - block 之间可按概率插入 cirq.wait(...)
+       - 最后再 append measurement
+    3. recovery_mode:
+       - "single_clifford": 标准 RB，末尾只补一个总逆 Clifford
+       - "reverse_inverse_chain": 调试/对照模式，补整串逆序逆门链
+    """
+    if m < 0:
+        raise ValueError(f"m must be non-negative, got {m}")
+    if idle_duration_ns < 0:
+        raise ValueError(f"idle_duration_ns must be non-negative, got {idle_duration_ns}")
+    if recovery_mode not in ("single_clifford", "reverse_inverse_chain"):
+        raise ValueError(
+            f"Unsupported recovery_mode={recovery_mode!r}, "
+            "expected 'single_clifford' or 'reverse_inverse_chain'."
+        )
+
+    seed = _resolve_rb_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    clifford_mats, clifford_gates = get_1q_clifford_library()
+    n_cliff = len(clifford_gates)
+
+    # 1) 随机采样 m 个 Clifford
+    seq_indices = rng.integers(0, n_cliff, size=m).tolist()
+
+    # 2) 构造逻辑 abstract Clifford circuit（仅随机序列，不含 idle）
+    abstract = cirq.Circuit()
+    for idx in seq_indices:
+        abstract.append(clifford_gates[int(idx)].on(qubit), strategy=cirq.InsertStrategy.NEW)
+
+    # 3) recovery
+    recovery_indices: List[int]
+    if recovery_mode == "single_clifford":
+        if len(abstract) == 0:
+            u_total = np.eye(2, dtype=complex)
+        else:
+            u_total = cirq.unitary(abstract)
+
+        u_recovery = u_total.conj().T
+        recovery_idx = _find_clifford_index_by_matrix(
+            u_recovery,
+            clifford_mats,
+            atol=atol,
+        )
+        recovery_indices = [int(recovery_idx)]
+    else:
+        recovery_indices = _build_reverse_inverse_chain_indices(
+            seq_indices,
+            clifford_mats,
+            atol=atol,
+        )
+
+    for ridx in recovery_indices:
+        abstract.append(clifford_gates[int(ridx)].on(qubit), strategy=cirq.InsertStrategy.NEW)
+
+    # 4) 准备编译函数
+    compile_fn = compiler if compiler is not None else (
+        lambda c: rb_1q_weak_compile_blockwise(
+            c,
+            atol=atol,
+            merge_within_block=False,
+        )
+    )
+
+    # 5) physical compiled circuit：
+    #    - 每个随机 Clifford 单独 weak compile
+    #    - 在随机 Clifford block 后按概率插入 idle
+    #    - recovery block 默认不插 idle（可选开启）
+    compiled = cirq.Circuit()
+
+    idle_after_random_flags = _sample_idle_after_flags(m, rng, idle_insert_prob)
+
+    # 随机 Clifford blocks
+    for i, idx in enumerate(seq_indices):
+        block_abs = cirq.Circuit(cirq.Moment([clifford_gates[int(idx)].on(qubit)]))
+        block_comp = compile_fn(block_abs)
+        _append_circuit_as_new_moments(compiled, block_comp)
+
+        if idle_after_random_flags[i] and idle_duration_ns > 0.0:
+            compiled.append(
+                cirq.wait(qubit, nanos=float(idle_duration_ns)),
+                strategy=cirq.InsertStrategy.NEW,
+            )
+
+    # recovery blocks
+    recovery_idle_inserted = False
+    for j, ridx in enumerate(recovery_indices):
+        block_abs = cirq.Circuit(cirq.Moment([clifford_gates[int(ridx)].on(qubit)]))
+        block_comp = compile_fn(block_abs)
+        _append_circuit_as_new_moments(compiled, block_comp)
+
+        # 默认不在 recovery 后插 idle；若需要则只在整个 recovery 末尾考虑一次
+        is_last_recovery = (j == len(recovery_indices) - 1)
+        if (
+            insert_idle_after_recovery
+            and is_last_recovery
+            and idle_duration_ns > 0.0
+            and bool(rng.random() < idle_insert_prob)
+        ):
+            compiled.append(
+                cirq.wait(qubit, nanos=float(idle_duration_ns)),
+                strategy=cirq.InsertStrategy.NEW,
+            )
+            recovery_idle_inserted = True
+
+    # 6) measurement 放在最后
+    if measure:
+        compiled.append(cirq.measure(qubit, key=key), strategy=cirq.InsertStrategy.NEW)
+
+    meta: Dict[str, Any] = {
+        "m": int(m),
+        "seed": int(seed),
+        "seq_indices": [int(x) for x in seq_indices],
+        "recovery_mode": recovery_mode,
+        "recovery_indices": [int(x) for x in recovery_indices],
+        "recovery_idx": int(recovery_indices[0]) if len(recovery_indices) == 1 else None,
+        "idle_insert_prob": float(idle_insert_prob),
+        "idle_duration_ns": float(idle_duration_ns),
+        "idle_after_random_flags": idle_after_random_flags,
+        "n_idle_inserted_random": int(sum(idle_after_random_flags)),
+        "idle_after_recovery": bool(recovery_idle_inserted),
+        "n_random_cliffords": int(m),
+        "n_recovery_cliffords": int(len(recovery_indices)),
+        "compiled_n_ops": int(sum(1 for _ in compiled.all_operations())),
+    }
+
+    return abstract, compiled, meta

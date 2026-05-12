@@ -185,6 +185,7 @@ class PhotonDecayNoiseModel(cirq.NoiseModel):
                 inner_ops.extend(op.circuit.all_operations())
             else:
                 inner_ops.append(op)
+
             if gamma > 0.0:
                 # 多比特门：对其所有参与 qubit 都绑上 phase_damp
                 for q in op.qubits:

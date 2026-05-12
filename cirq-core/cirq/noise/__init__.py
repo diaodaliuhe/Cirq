@@ -26,6 +26,7 @@ from cirq.noise.utils import (
     TimedCircuitContext as TimedCircuitContext,
     assign_timed_circuit_context as assign_timed_circuit_context,
     fidelity as fidelity,
+    fidelity1 as fidelity1,
     trace_distance as trace_distance,
     operator_fidelity as operator_fidelity,
     build_circuit as build_circuit,
@@ -44,6 +45,7 @@ from cirq.noise.utils import (
     _sample_moment as _sample_moment,
     build_rb1_circuit as build_rb1_circuit,
     _run_rb_sweep_custom as _run_rb_sweep_custom,
+    build_1q_clifford_rb_circuit_compiled as build_1q_clifford_rb_circuit_compiled,
 
     _ALLOWED_CONSTS as _ALLOWED_CONSTS,
     _ALLOWED_FUNCS as _ALLOWED_FUNCS,
@@ -62,6 +64,7 @@ from cirq.noise.utils import (
     # build_flux_quasistatic_from_yaml as build_flux_quasistatic_from_yaml,
     wrap_to_composite as wrap_to_composite,
     make_noise_model as make_noise_model,
+    get_flux_sampling_cfg as get_flux_sampling_cfg,
 
     clifford_1q_gate_set as clifford_1q_gate_set,
 
@@ -79,5 +82,6 @@ from cirq.noise.utils import (
     merge_zpow_subcircuit as merge_zpow_subcircuit,
     asapize_circuit as asapize_circuit,
     all_in_one_compile as all_in_one_compile,
+    rb_1q_weak_compile_blockwise as rb_1q_weak_compile_blockwise
 )
 

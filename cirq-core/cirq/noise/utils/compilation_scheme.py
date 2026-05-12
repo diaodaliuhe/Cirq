@@ -439,3 +439,43 @@ def all_in_one_compile(circuit: cirq.Circuit) -> cirq.Circuit:
     p3 = merge_zpow_subcircuit(p2)
     p4 = asapize_circuit(p3)
     return p4
+
+def rb_1q_weak_compile_blockwise(
+    circuit: cirq.Circuit,
+    *,
+    atol: float = 1e-8,
+    merge_within_block: bool = False,
+) -> cirq.Circuit:
+    """
+    RB 专用弱编译：
+    - 假定输入电路中每个 moment 对应一个 Clifford block
+    - 对每个 moment 独立编译到 {ZPow, YPow}（以及测量等允许门）
+    - 不跨 moment / block 做 merge，不做 asapize
+
+    用途：
+    - 保留 RB 序列长度结构
+    - 允许把抽象 1Q Clifford 门分解成可加噪的 native 1Q 门
+    """
+    gateset = CZ_Y_Z_gateset(
+        preserve_moment_structure=True,
+        reorder_operations=False,
+        atol=atol,
+    )
+
+    out = cirq.Circuit()
+
+    for moment in circuit:
+        block = cirq.Circuit(cirq.Moment(moment.operations))
+        block = optimize_for_target_gateset(block, gateset=gateset)
+
+        if merge_within_block:
+            block = merge_rz_runs_no_advance(block, atol=atol)
+
+        block = drop_negligible_operations(block, atol=atol)
+        block = drop_empty_moments(block)
+
+        out += block
+
+    out = drop_negligible_operations(out, atol=atol)
+    out = drop_empty_moments(out)
+    return out

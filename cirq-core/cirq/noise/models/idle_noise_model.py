@@ -1,7 +1,7 @@
 import cirq
 import math
 import numpy as np
-from typing import Sequence, List
+from typing import Sequence, List, Optional
 
 
 class IdleNoiseModel(cirq.NoiseModel):
@@ -36,7 +36,48 @@ class IdleNoiseModel(cirq.NoiseModel):
     def _is_virtual_op(self, op: cirq.Operation) -> bool:
         if not self.treat_z_as_virtual:
             return False
-        return isinstance(op.gate, cirq.ZPowGate)
+        
+        if isinstance(op,cirq.CircuitOperation):
+            if all(isinstance(inner_op.gate, cirq.ZPowGate) for inner_op in op.circuit.all_operations()):
+                return True
+            return False
+        else:
+            if isinstance(op.gate, cirq.ZPowGate):
+                return True
+            return False
+
+    def _unwrap_single_waitgate(self, op: cirq.Operation) -> Optional[cirq.Operation]:
+        """If op is a WaitGate or a CircuitOperation wrapping a single WaitGate, return the outer-level WaitGate op."""
+
+        # Case 1: direct WaitGate
+        if isinstance(op.gate, cirq.WaitGate):
+            return op
+
+        # Case 2: CircuitOperation that contains exactly ONE op and it's WaitGate
+        if isinstance(op, cirq.CircuitOperation):
+            inner_ops = list(op.circuit.all_operations())
+            if len(inner_ops) != 1:
+                return None
+
+            inner = inner_ops[0]
+            if not isinstance(inner.gate, cirq.WaitGate):
+                return None
+
+            # duration (handle repetitions if it's an int)
+            dur = inner.gate.duration
+            rep = getattr(op, "repetitions", 1)
+            if isinstance(rep, int):
+                dur = dur * rep  # cirq.Duration supports * int
+            # if rep is parameterized/sympy -> keep dur as-is (or raise if you prefer strict)
+
+            # Map inner qubits to outer qubits using qubit_map if exists
+            qmap = getattr(op, "qubit_map", None) or {}
+            outer_qubits = tuple(qmap.get(q, q) for q in inner.qubits)
+
+            # Return an equivalent outer WaitGate op
+            return cirq.WaitGate(dur).on(*outer_qubits)
+
+        return None
     
     def _find_noise_ops(
             self,
@@ -54,7 +95,7 @@ class IdleNoiseModel(cirq.NoiseModel):
 
         # 2) 若整层只有 virtual 操作（如纯 ZPow），则视为 0 时间层，不加 idle 噪声
         if not non_virtual_ops:
-            return False, [], []
+            return False, [], [], []
         
         one_qubit_op_qubits = []
 
@@ -68,9 +109,30 @@ class IdleNoiseModel(cirq.NoiseModel):
         #    active_qubits = 有真实门的比特；其它比特视为 idle
         active_qubits = {q for op in non_virtual_ops for q in op.qubits}
         idle_qubits = [q for q in system_qubits if q not in active_qubits]
+        delay_qubits_and_ops = {}
+        for op in ops:
+            wop = self._unwrap_single_waitgate(op)
+            if wop is None:
+                continue
+            q = wop.qubits[0]
+            for q in wop.qubits:
+                delay_qubits_and_ops[q] = wop
+        
+        has_delay = True if delay_qubits_and_ops else False
+
+        one_qubit_op_qubits = [q for q in one_qubit_op_qubits if q not in delay_qubits_and_ops.keys()]
+
+        # print(f"active_qubits: {active_qubits},\nidle_qubits: {idle_qubits},\ndelay_qubits_and_ops: {delay_qubits_and_ops},\none_qubit_op_qubits: {one_qubit_op_qubits}")
 
         # 4) 计算噪声参数
-        duration = self.t2 if has_multi else self.t1
+        if has_delay:
+            delay_max = max(wop.gate.duration.total_nanos() for wop in delay_qubits_and_ops.values()) / 1e9
+            if has_multi:
+                duration = max(self.t2, delay_max)
+            else:
+                duration = max(self.t1, delay_max)
+        else:
+            duration = self.t2 if has_multi else self.t1
 
         p1 = 1.0 - np.exp(- duration / self.T1)
         pphi = 1.0 - np.exp(- duration / self.Tphi)
@@ -81,6 +143,18 @@ class IdleNoiseModel(cirq.NoiseModel):
         # 5) 生成噪声 op
         idle_ops = []
         for q in idle_qubits:
+            if math.isclose(p1, 0) or p1 > 0:
+                idle_ops.append(cirq.amplitude_damp(p1).on(q))
+            if math.isclose(pphi, 0) or pphi > 0:
+                idle_ops.append(cirq.phase_damp(pphi).on(q))
+
+        for q in list(delay_qubits_and_ops.keys()):
+            delay_time = delay_qubits_and_ops[q].gate.duration.total_nanos() / 1e9
+            p1 = 1.0 - np.exp(- delay_time / self.T1)
+            pphi = 1.0 - np.exp(- delay_time / self.Tphi)
+
+            p1 = 1.0 - (1.0 - p1) ** self.scale
+            pphi = 1.0 - (1.0 - pphi) ** self.scale
             if math.isclose(p1, 0) or p1 > 0:
                 idle_ops.append(cirq.amplitude_damp(p1).on(q))
             if math.isclose(pphi, 0) or pphi > 0:
@@ -103,7 +177,7 @@ class IdleNoiseModel(cirq.NoiseModel):
                     idle_ops.append(cirq.phase_damp(pphi).on(q))
         # print(f"idle qubits:[{idle_qubits}], one_qubit_op_qubits:[{one_qubit_op_qubits}]")
 
-        return has_multi, one_qubit_op_qubits, idle_ops
+        return has_multi, one_qubit_op_qubits, idle_ops, delay_qubits_and_ops
 
     def noisy_moment(
         self,
@@ -112,30 +186,36 @@ class IdleNoiseModel(cirq.NoiseModel):
     ) -> cirq.Moment:
         
         new_ops: List[cirq.Operation] = []
-        has_multi, one_qubit_op_qubits, idle_ops = self._find_noise_ops(moment, system_qubits)
-        
+        has_multi, one_qubit_op_qubits, idle_ops, delay_qubits_and_ops = self._find_noise_ops(moment, system_qubits)
+        # print(f"has_multi: {has_multi}, one_qubit_op_qubits: {one_qubit_op_qubits}, idle_ops: {idle_ops}")
         ops_temp: List[cirq.Operation] = []
+        ops_after_wrapped: List[cirq.Operation] = []
         for i, idle_op in enumerate(idle_ops):
             ops_temp.append(idle_op)
             if i % 2 == 1:
-                if ops_temp[0].qubits[0] in one_qubit_op_qubits:
-                    one_qubit_op: cirq.Operation = None
+                q = ops_temp[0].qubits[0]
+                if (q in one_qubit_op_qubits) or (q in delay_qubits_and_ops.keys()):
+                    one_qubit_op: Optional[cirq.Operation] = None
                     for op in moment.operations:
-                        if ops_temp[0].qubits[0] in op.qubits:
+                        if q in op.qubits:
                             one_qubit_op = op
                             break
-                    
-                    if isinstance(one_qubit_op, cirq.CircuitOperation):
-                        ops_temp = list(one_qubit_op.circuit.all_operations()) + ops_temp
-                    elif isinstance(one_qubit_op, cirq.Operation):
-                        ops_temp = [one_qubit_op] + ops_temp
+
+                    if one_qubit_op is not None:
+                        if isinstance(one_qubit_op, cirq.CircuitOperation):
+                            ops_temp = list(one_qubit_op.circuit.all_operations()) + ops_temp
+                        else:
+                            ops_temp = [one_qubit_op] + ops_temp
+                        ops_after_wrapped.append(one_qubit_op)
 
                 new_ops.append(cirq.CircuitOperation(cirq.FrozenCircuit(ops_temp)))
                 ops_temp = []
 
-        for op in moment.operations:
-            if len(op.qubits) > (1 if has_multi else 0):
+        for op in [op for op in moment.operations if op not in ops_after_wrapped]:
+            if isinstance(op, cirq.CircuitOperation):
                 new_ops.append(op)
+            else:
+                new_ops.append(cirq.CircuitOperation(cirq.FrozenCircuit([op])))
 
         return cirq.Moment(new_ops)
 

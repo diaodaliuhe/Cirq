@@ -210,16 +210,16 @@ def is_flux_enabled(noise_cfg: Dict) -> bool:
     node = noise_cfg.get("flux_quasistatic", {})
     return bool(node.get("enabled", True))
 
-def get_flux_sigma_seed(noise_cfg: Dict) -> tuple[float, int | None]:
+def get_flux_sigma_seed(noise_cfg: Dict) -> Tuple[float, Any]:
     """
         从 YAML 里获取 flux_quasistatic 的 sigma 和 seed。
         Args:
             noise_cfg: 从顶层 "noise" 节点传入的 dict。
     """
-    node = noise_cfg.get("flux_quasistatic", {})
-    sigma = eval_number(node.get("sigma", noise_cfg.get("sigma", 0.05)))
-    seed = node.get("seed")  # 可为 None
-    return sigma, seed
+    node = noise_cfg.get("flux_quasistatic", {}) or {}
+    sigma = eval_number(node.get("sigma", 0.0))
+    flux_seed = node.get("flux_seed", None)
+    return float(sigma), flux_seed
 
 # def build_flux_quasistatic_from_yaml(
 #     cfg: Dict[str, Any],
@@ -320,3 +320,41 @@ def make_noise_model(
     }
 
     return CompositeNoiseModel(models), meta
+
+def get_flux_sampling_cfg(noise_cfg: Dict) -> Dict[str, Any]:
+    fx = noise_cfg.get("flux_quasistatic", {}) or {}
+    node = fx.get("sampling", {}) or {}
+
+    mode = str(node.get("mode", "local_correlated")).strip().lower()
+    if mode not in ("local_correlated", "global_trace_ar1"):
+        raise ValueError(
+            f"Unsupported flux sampling mode: {mode!r}. "
+            f"Expected 'local_correlated' or 'global_trace_ar1'."
+        )
+
+    stride_raw = node.get("sample_stride_segments", "auto")
+    if stride_raw is None or (isinstance(stride_raw, str) and stride_raw.strip().lower() == "auto"):
+        stride = None
+    else:
+        stride = int(stride_raw)
+        if stride <= 0:
+            raise ValueError(
+                f"'sample_stride_segments' must be positive or 'auto', got {stride_raw!r}"
+            )
+
+    rho_raw = node.get("rho", None)
+    rho = None if rho_raw is None else float(eval_number(rho_raw))
+
+    if mode == "global_trace_ar1":
+        if rho is None:
+            raise ValueError("flux_quasistatic.sampling.rho is required for mode='global_trace_ar1'.")
+        if not (0.0 <= rho < 1.0):
+            raise ValueError(f"rho must satisfy 0 <= rho < 1, got {rho}")
+    else:
+        rho = None
+
+    return {
+        "mode": mode,
+        "sample_stride_segments": stride,
+        "rho": rho,
+    }

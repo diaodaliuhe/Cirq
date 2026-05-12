@@ -2,6 +2,19 @@ import cirq
 from typing import Dict, Any, List
 
 def _gate_duration_ns(op: cirq.Operation, t1: float, t2: float) -> float:
+    gate = getattr(op, "gate", None)
+
+    # 官方 delay / wait 门：按其自身 duration 计时
+    if isinstance(gate, cirq.WaitGate):
+        dur = gate.duration
+        try:
+            return float(dur.total_nanos())
+        except TypeError as e:
+            raise TypeError(
+                f"WaitGate duration is not numeric: {dur!r}. "
+                "compute_timing_summary 目前只支持数值型 delay duration。"
+            ) from e
+        
     n = len(op.qubits)
     return t1 if n == 1 else (t2 if n == 2 else t2)
 

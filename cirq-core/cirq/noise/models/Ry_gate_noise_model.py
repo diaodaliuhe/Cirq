@@ -12,7 +12,9 @@ class RyGateNoiseModel(cirq.NoiseModel):
                  Tphi: float = 60e-6,
                  p_axis: float = 1e-4,     # 轴向（沿 Y）
                  p_plane: float = 5e-4,    # 平面（X/Z）
-                 scale: float = 1.0):
+                 scale: float = 1.0,
+                 simple: bool = False,
+                 ):
         """
         Y: 仍只对 Y^±0.5（±π/2）加门噪声；Z: 默认 virtual，不加门噪声。
         若将 z_policy='physical'，则对 ZPow 也按同一范式加噪声（轴取 Z）。
@@ -25,6 +27,8 @@ class RyGateNoiseModel(cirq.NoiseModel):
         self.p_plane= float(p_plane)
 
         self.scale = float(scale)
+
+        self.simple = simple
 
     # --------- helpers ---------
     def _compute_ap_params(self, duration: float):
@@ -63,10 +67,12 @@ class RyGateNoiseModel(cirq.NoiseModel):
                 return [], []
                 
         elif isinstance(operation, cirq.Operation):
-            if not (isinstance(operation.gate, cirq.YPowGate) or isinstance(operation.gate, cirq.CZPowGate)):
+            if not (isinstance(operation.gate, cirq.YPowGate) or isinstance(operation.gate, cirq.CZPowGate) or self.simple):
                 return [], []
             
         if len(operation.qubits) == 1:
+            if self.simple and isinstance(operation.gate, cirq.WaitGate):
+                return [], []
             q = operation.qubits[0]
             
             p1, pphi = self._compute_ap_params(self.t1 / 2)

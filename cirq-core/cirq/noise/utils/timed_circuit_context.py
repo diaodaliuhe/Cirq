@@ -221,6 +221,8 @@ def assign_timed_circuit_context(
                     op_true = op
                     if isinstance(op.gate, cirq.ZPowGate):
                         op_duration = 0.0
+                    elif isinstance(op.gate, cirq.WaitGate):
+                        op_duration = op.gate.duration.total_nanos()
                     else:
                         op_duration = t1
             elif len(op.qubits) == 2:

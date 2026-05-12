@@ -106,6 +106,9 @@ class SegmentedFluxNoiseModel(cirq.NoiseModel):
     def _find_noise_ops(self, operation: cirq.Operation) -> cirq.OP_TREE:
         noise_ops: List[cirq.Operation] = []
 
+        if isinstance(operation.gate, cirq.WaitGate):
+            return []
+
         sig = self._op_signature(operation)
         infos = self._sig_map.get(sig)
         if not infos:
