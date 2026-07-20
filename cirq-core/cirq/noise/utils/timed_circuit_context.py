@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import math
+import random
 
 import cirq
 
@@ -173,6 +174,9 @@ def assign_timed_circuit_context(
     t2: float = 40.0,  # 双比特门的时间
     tau_c: float = 60.0,  # segment 的大小
     treat_z_as_virtual: bool = True,
+    segment_origin_offset: float = 0.0,
+    assignment_rule: str = "max_overlap",
+    assignment_seed: Optional[int] = None,
 ) -> TimedCircuitContext:
     """
     为给定 Cirq 电路中的每个操作分配开始时间、持续时间、所属 segment 编号，
@@ -184,10 +188,74 @@ def assign_timed_circuit_context(
         t2: 双比特门的持续时间（单位 ns）
         tau_c: 截断时间（segment 大小，单位 ns）
         treat_z_as_virtual: 若为 True，则 ZPowGate 视为 virtual-Z，duration=0
+        segment_origin_offset: segment grid offset in ns. The segment id is computed
+            from start_time + segment_origin_offset.
+        assignment_rule: "max_overlap" (current default), "start_time", "midpoint",
+            or "random_overlap".
+        assignment_seed: deterministic seed for "random_overlap".
 
     返回：
         TimedCircuitContext，包括原始电路和其 timing map
     """
+    assignment_rule = str(assignment_rule).lower()
+    if assignment_rule not in ("max_overlap", "start_time", "midpoint", "random_overlap"):
+        raise ValueError(f"Unknown assignment_rule: {assignment_rule!r}")
+
+    segment_origin_offset = float(segment_origin_offset)
+    assignment_rng = random.Random(assignment_seed)
+
+    def _seg_at(t: float) -> int:
+        return int((float(t) + segment_origin_offset) / tau_c)
+
+    def _assign_segment(start: float, duration: float) -> int:
+        shifted_start = float(start) + segment_origin_offset
+        shifted_end = shifted_start + float(duration)
+
+        if assignment_rule == "start_time":
+            return _seg_at(start)
+
+        if assignment_rule == "midpoint":
+            return int((shifted_start + 0.5 * float(duration)) / tau_c)
+
+        if assignment_rule == "random_overlap":
+            start_seg = int(shifted_start / tau_c)
+            end_seg = int(shifted_end / tau_c)
+            if duration <= 0.0 or end_seg == start_seg:
+                return start_seg
+
+            segments = list(range(start_seg, end_seg + 1))
+            weights = []
+            for seg in segments:
+                left = max(shifted_start, seg * tau_c)
+                right = min(shifted_end, (seg + 1) * tau_c)
+                weights.append(max(0.0, right - left))
+
+            total = sum(weights)
+            if total <= 0.0:
+                return start_seg
+
+            r = assignment_rng.random() * total
+            acc = 0.0
+            for seg, weight in zip(segments, weights):
+                acc += weight
+                if r <= acc:
+                    return int(seg)
+            return int(segments[-1])
+
+        start_seg = int(shifted_start / tau_c)
+        end_seg = int(shifted_end / tau_c)
+
+        if end_seg == start_seg:
+            return start_seg
+        elif end_seg == start_seg + 1:
+            divide_spot = (start_seg + 1) * tau_c
+            pre = divide_spot - shifted_start
+            post = shifted_end - divide_spot
+            return end_seg if post > pre else start_seg
+        elif end_seg > start_seg + 1:
+            return start_seg + 1
+        return start_seg
+
     two_q_slots = int(round(t2 / t1))  # 确保 t2 是 t1 的倍数，如果是的话，可以按照相同方式来调整
     if abs(two_q_slots * t1 - t2) > 1e-9:
         raise ValueError(f"t2={t2} 不是 t1={t1} 的整数倍，无法构造整齐 time slice。")
@@ -237,20 +305,7 @@ def assign_timed_circuit_context(
             
             op_times.append(op_duration)
 
-            start_seg = 0 if math.isclose(start_time, 0.0) else int(start_time / tau_c)
-
-            end_seg = int((start_time + op_duration)/ tau_c)
-
-            if end_seg == start_seg:
-                segment_id = start_seg
-            elif end_seg == start_seg + 1:
-                divide_spot = (start_seg + 1) * tau_c
-                pre = divide_spot -start_time
-                post = start_time + op_duration - divide_spot
-                segment_id = end_seg if post > pre else start_seg
-            elif end_seg > start_seg + 1:
-                segment_id = start_seg + 1
-
+            segment_id = _assign_segment(start_time, op_duration)
 
             occ = seen_count.get(op, 0)
             seen_count[op] = occ + 1
